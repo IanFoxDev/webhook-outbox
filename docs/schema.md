@@ -22,6 +22,9 @@ with your own migration tool. Use one or the other: `migrate` records what it ap
   after a success and cleared by the next success. `endpoints enable` clears it too.
 - `webhook_messages.payload` is the exact body that is signed and sent. The application
   serializes it once; the relay does not parse or rewrite it.
+- `webhook_deliveries.leased_until` is set while a relay sends the delivery and cleared
+  when the attempt is recorded. The relay counts these rows to limit the requests in
+  flight to one endpoint.
 
 ## Endpoints
 

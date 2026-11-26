@@ -41,7 +41,7 @@ func TestMigrateNeedsDatabaseURL(t *testing.T) {
 
 func TestMigrate(t *testing.T) {
 	env := map[string]string{"DATABASE_URL": pgtest.URL(t)}
-	if code, out, errOut := cli(t, env, "migrate"); code != 0 || out != "applied 0001_init.sql\n" {
+	if code, out, errOut := cli(t, env, "migrate"); code != 0 || out != "applied 0001_init.sql\napplied 0002_endpoint_limit.sql\n" {
 		t.Fatalf("exit %d, %q, %q", code, out, errOut)
 	}
 	if code, out, _ := cli(t, env, "migrate"); code != 0 || out != "up to date\n" {

@@ -16,7 +16,7 @@ func TestMigrateTwice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied) != 1 || applied[0] != "0001_init.sql" {
+	if len(applied) != 2 || applied[0] != "0001_init.sql" || applied[1] != "0002_endpoint_limit.sql" {
 		t.Fatalf("applied %v", applied)
 	}
 	applied, err = schema.Migrate(ctx, conn)
