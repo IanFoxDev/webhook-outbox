@@ -49,9 +49,22 @@ services:
     build: *php
     command: ["php", "-S", "0.0.0.0:8000", "/app/receiver/index.php"]
     environment:
-      # Requests to /timeout and /slow hold a worker each.
       PHP_CLI_SERVER_WORKERS: 16
     ports: ["${RECEIVER_PORT:-8001}:8000"]
+    volumes: [secrets:/secrets:ro]
+    healthcheck: *http
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  # The same receiver, serving only /timeout. A worker of PHP's built-in server can
+  # accept a second connection while it sleeps on the first, so in one server /slow
+  # would sometimes wait behind /timeout and time out too.
+  hang:
+    build: *php
+    command: ["php", "-S", "0.0.0.0:8000", "/app/receiver/index.php"]
+    environment:
+      PHP_CLI_SERVER_WORKERS: 4
     volumes: [secrets:/secrets:ro]
     healthcheck: *http
     depends_on:
@@ -76,6 +89,8 @@ services:
       retries: 30
     depends_on:
       receiver:
+        condition: service_healthy
+      hang:
         condition: service_healthy
 
   # docker compose run --rm e2e: places orders and checks what each endpoint got.

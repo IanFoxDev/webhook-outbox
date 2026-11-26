@@ -9,6 +9,7 @@ down, or say the endpoint is gone.
 |---|---|---|
 | `shop` | `POST /orders` with `customer` and `total`, see [shop/index.php](shop/index.php) | 8000 |
 | `receiver` | one endpoint per scenario, checks every signature, `GET /log`, see [receiver/index.php](receiver/index.php) | 8001 |
+| `hang` | the same receiver for `/timeout` only, so a hanging request does not hold up the others | |
 | `relay` | built from [../../relay](../../relay), `/metrics` | 8080 |
 | `postgres` | the shop's database with the `webhook_` tables and `orders` | |
 

@@ -3,7 +3,8 @@
 declare(strict_types=1);
 
 // One endpoint per receiver scenario. The customer is named after the scenario, so
-// an order for customer "flaky" goes to http://receiver:8000/flaky only.
+// an order for customer "flaky" goes to http://receiver:8000/flaky only. /timeout is
+// served by its own copy of the receiver, see compose.yaml.
 //
 // A real application would run `webhook-outbox-relay endpoints add` or insert the row
 // from its settings page; here a few INSERTs keep the example to one PHP image.
@@ -22,7 +23,8 @@ $secrets = [];
 foreach (SCENARIOS as $scenario) {
     $id = 'ep_'.$scenario;
     $secret = 'whsec_'.base64_encode(random_bytes(32));
-    $insert->execute([$id, $scenario, 'http://receiver:8000/'.$scenario, $secret, '{order.placed}', 'receiver scenario '.$scenario]);
+    $host = $scenario === 'timeout' ? 'hang' : 'receiver';
+    $insert->execute([$id, $scenario, "http://$host:8000/$scenario", $secret, '{order.placed}', 'receiver scenario '.$scenario]);
     $secrets[$scenario] = $secret;
     echo "registered $id\n";
 }
