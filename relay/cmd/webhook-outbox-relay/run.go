@@ -47,6 +47,16 @@ func config(getenv func(string) string) (relay.Config, error) {
 	number("RELAY_BATCH_SIZE", &c.BatchSize)
 	number("RELAY_CONCURRENCY", &c.Concurrency)
 	number("RELAY_RESPONSE_LIMIT", &c.ResponseLimit)
+	if v := getenv("RELAY_ENDPOINT_CONCURRENCY"); v != "" && err == nil {
+		n, e := strconv.Atoi(v)
+		if e != nil || n < 0 {
+			return c, fmt.Errorf("RELAY_ENDPOINT_CONCURRENCY: %q is not a number; 0 turns the limit off", v)
+		}
+		c.EndpointConcurrency = n
+		if n == 0 {
+			c.EndpointConcurrency = -1
+		}
+	}
 	if v := getenv("RELAY_DISABLE_AFTER"); v != "" && err == nil {
 		d, ok := days(v)
 		switch {

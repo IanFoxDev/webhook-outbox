@@ -38,6 +38,9 @@ type Config struct {
 	BatchSize int
 	// Concurrency is how many requests are in flight at once.
 	Concurrency int
+	// EndpointConcurrency is how many requests are in flight to one endpoint, counted
+	// over all relays sharing the database. A negative value turns the limit off.
+	EndpointConcurrency int
 	// Timeout is the limit for one request, from connecting to reading the response.
 	Timeout time.Duration
 	// Schedule is the pause after each failed attempt. A delivery that failed
@@ -88,6 +91,9 @@ func (c Config) Defaults() Config {
 	if c.Concurrency <= 0 {
 		c.Concurrency = 16
 	}
+	if c.EndpointConcurrency == 0 {
+		c.EndpointConcurrency = 4
+	}
 	if c.Timeout <= 0 {
 		c.Timeout = 15 * time.Second
 	}
@@ -118,6 +124,9 @@ type Relay struct {
 	pool   *pgxpool.Pool
 	cfg    Config
 	client *http.Client
+	// slots holds a token per request Run has in flight; freed wakes Run when one ends.
+	slots chan struct{}
+	freed chan struct{}
 }
 
 // New returns a relay for the database behind pool.
@@ -128,8 +137,10 @@ func New(pool *pgxpool.Pool, cfg Config) *Relay {
 		dialer.Control = netguard.Control
 	}
 	return &Relay{
-		pool: pool,
-		cfg:  cfg,
+		pool:  pool,
+		cfg:   cfg,
+		slots: make(chan struct{}, cfg.Concurrency),
+		freed: make(chan struct{}, 1),
 		client: &http.Client{
 			Timeout: cfg.Timeout,
 			Transport: &http.Transport{
@@ -152,9 +163,18 @@ func New(pool *pgxpool.Pool, cfg Config) *Relay {
 
 // Run works until ctx is cancelled. Requests in flight are finished, so a stop takes
 // up to Timeout.
+//
+// Run does not wait for the requests it starts: it claims only as many deliveries as
+// it has free request slots, and claims again when a slot frees up. A slow endpoint
+// then holds its own requests and not the whole relay, and a claimed delivery is sent
+// at once instead of waiting in the process while its lease runs out.
 func (r *Relay) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	// A stop does not cut requests in flight: their results are recorded.
+	work := context.WithoutCancel(ctx)
 	for {
-		busy, err := r.Round(ctx)
+		busy, err := r.step(ctx, work, &wg)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -167,13 +187,50 @@ func (r *Relay) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-r.freed:
 		case <-time.After(r.cfg.PollInterval):
 		}
 	}
 }
 
-// Round dispatches one batch of messages and sends one batch of due deliveries. It
-// reports whether either batch was full, so there is likely more to do.
+// step dispatches a batch and starts requests for up to the free slots. It reports
+// whether there is likely more to do right away.
+func (r *Relay) step(ctx, work context.Context, wg *sync.WaitGroup) (bool, error) {
+	dispatched, err := r.Dispatch(ctx)
+	if err != nil {
+		return false, err
+	}
+	free := min(cap(r.slots)-len(r.slots), r.cfg.BatchSize)
+	if free == 0 {
+		return dispatched == r.cfg.BatchSize, nil
+	}
+	claimed, err := r.claim(ctx, free)
+	if err != nil {
+		return false, fmt.Errorf("claim: %w", err)
+	}
+	for _, d := range claimed {
+		r.slots <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() {
+				<-r.slots
+				select {
+				case r.freed <- struct{}{}:
+				default:
+				}
+				wg.Done()
+			}()
+			if err := r.record(work, d, r.send(work, d)); err != nil {
+				r.cfg.Logger.Error("recording an attempt failed", "error", err)
+			}
+		}()
+	}
+	return dispatched == r.cfg.BatchSize || len(claimed) == free, nil
+}
+
+// Round dispatches one batch of messages and sends one batch of due deliveries, and
+// returns when they are recorded. It reports whether either batch was full, so there
+// is likely more to do. Run does the same without waiting for the requests.
 func (r *Relay) Round(ctx context.Context) (bool, error) {
 	dispatched, err := r.Dispatch(ctx)
 	if err != nil {
@@ -226,44 +283,10 @@ type delivery struct {
 }
 
 // Deliver claims up to BatchSize due deliveries, sends them and records the results.
-// It returns how many it claimed.
+// It returns how many it claimed, after all of them are recorded.
 func (r *Relay) Deliver(ctx context.Context) (int, error) {
-	// Claiming moves next_attempt_at past the end of the request, so the row is not due
-	// for anyone else while it is being sent. If this relay dies, the lease runs out and
-	// another relay sends it again: delivery is at least once.
-	lease := r.cfg.Timeout + 30*time.Second
-	rows, err := r.pool.Query(ctx, `
-		WITH c AS (
-			SELECT d.id FROM webhook_deliveries d
-			JOIN webhook_endpoints e ON e.id = d.endpoint_id
-			WHERE d.status = 'pending' AND d.next_attempt_at <= now() AND e.disabled_at IS NULL
-			ORDER BY d.next_attempt_at
-			LIMIT $1
-			FOR UPDATE OF d SKIP LOCKED
-		), u AS (
-			UPDATE webhook_deliveries d SET next_attempt_at = now() + $2 * interval '1 microsecond', updated_at = now()
-			FROM c WHERE d.id = c.id
-			RETURNING d.id, d.attempts, d.message_id, d.endpoint_id
-		)
-		SELECT u.id, u.endpoint_id, u.attempts, m.id, m.payload, e.url, e.secret
-		FROM u
-		JOIN webhook_messages m ON m.id = u.message_id
-		JOIN webhook_endpoints e ON e.id = u.endpoint_id`, r.cfg.BatchSize, lease.Microseconds())
+	claimed, err := r.claim(ctx, r.cfg.BatchSize)
 	if err != nil {
-		return 0, fmt.Errorf("claim: %w", err)
-	}
-	var claimed []delivery
-	for rows.Next() {
-		var d delivery
-		var payload string
-		if err := rows.Scan(&d.id, &d.endpoint, &d.attempts, &d.message, &payload, &d.url, &d.secret); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("claim: %w", err)
-		}
-		d.payload = []byte(payload)
-		claimed = append(claimed, d)
-	}
-	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("claim: %w", err)
 	}
 
@@ -287,6 +310,112 @@ func (r *Relay) Deliver(ctx context.Context) (int, error) {
 	}
 	wg.Wait()
 	return len(claimed), errors.Join(errs...)
+}
+
+// claimedRows is the end of a claim: the claimed rows joined with what a request needs.
+const claimedRows = `
+	SELECT u.id, u.endpoint_id, u.attempts, m.id, m.payload, e.url, e.secret
+	FROM u
+	JOIN webhook_messages m ON m.id = u.message_id
+	JOIN webhook_endpoints e ON e.id = u.endpoint_id`
+
+// claim takes due deliveries for this relay. Claiming moves next_attempt_at and
+// leased_until past the end of the request, so the row is not due for anyone else
+// while it is being sent, and counts as a request in flight to its endpoint. If this
+// relay dies, the lease runs out and another relay sends it again: delivery is at
+// least once.
+func (r *Relay) claim(ctx context.Context, limit int) ([]delivery, error) {
+	lease := (r.cfg.Timeout + 30*time.Second).Microseconds()
+	if r.cfg.EndpointConcurrency < 0 {
+		rows, err := r.pool.Query(ctx, `
+			WITH c AS (
+				SELECT d.id FROM webhook_deliveries d
+				JOIN webhook_endpoints e ON e.id = d.endpoint_id
+				WHERE d.status = 'pending' AND d.next_attempt_at <= now() AND e.disabled_at IS NULL
+				ORDER BY d.next_attempt_at
+				LIMIT $1
+				FOR UPDATE OF d SKIP LOCKED
+			), u AS (
+				UPDATE webhook_deliveries d SET next_attempt_at = now() + $2 * interval '1 microsecond',
+					leased_until = now() + $2 * interval '1 microsecond', updated_at = now()
+				FROM c WHERE d.id = c.id
+				RETURNING d.id, d.attempts, d.message_id, d.endpoint_id
+			)`+claimedRows, limit, lease)
+		if err != nil {
+			return nil, err
+		}
+		return scanDeliveries(rows)
+	}
+
+	// With a limit per endpoint the claim takes two statements; ADR 0002 explains why.
+	// The first locks the endpoints with due work, oldest due first, so no other relay
+	// claims for them until this transaction ends. The second starts after the locks
+	// are held, so its count of requests in flight sees every lease committed before.
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := tx.Query(ctx, `
+		SELECT e.id FROM webhook_endpoints e
+		CROSS JOIN LATERAL (
+			SELECT d.next_attempt_at FROM webhook_deliveries d
+			WHERE d.endpoint_id = e.id AND d.status = 'pending' AND d.next_attempt_at <= now()
+			ORDER BY d.next_attempt_at
+			LIMIT 1
+		) due
+		WHERE e.disabled_at IS NULL
+		ORDER BY due.next_attempt_at
+		LIMIT $1
+		FOR NO KEY UPDATE OF e SKIP LOCKED`, limit)
+	if err != nil {
+		return nil, err
+	}
+	endpoints, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(endpoints) == 0 {
+		return nil, err
+	}
+	rows, err = tx.Query(ctx, `
+		WITH f AS (
+			SELECT e.id, $3 - (
+				SELECT count(*) FROM webhook_deliveries x
+				WHERE x.endpoint_id = e.id AND x.leased_until > now() AND x.status = 'pending'
+			) AS free
+			FROM unnest($1::text[]) AS e (id)
+		), c AS (
+			SELECT x.id FROM f CROSS JOIN LATERAL (
+				SELECT d.id, d.next_attempt_at FROM webhook_deliveries d
+				WHERE d.endpoint_id = f.id AND d.status = 'pending' AND d.next_attempt_at <= now()
+				ORDER BY d.next_attempt_at
+				LIMIT greatest(f.free, 0)
+				FOR UPDATE SKIP LOCKED
+			) x
+			ORDER BY x.next_attempt_at
+			LIMIT $4
+		), u AS (
+			UPDATE webhook_deliveries d SET next_attempt_at = now() + $2 * interval '1 microsecond',
+				leased_until = now() + $2 * interval '1 microsecond', updated_at = now()
+			FROM c WHERE d.id = c.id
+			RETURNING d.id, d.attempts, d.message_id, d.endpoint_id
+		)`+claimedRows, endpoints, lease, r.cfg.EndpointConcurrency, limit)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanDeliveries(rows)
+	if err != nil {
+		return nil, err
+	}
+	return out, tx.Commit(ctx)
+}
+
+func scanDeliveries(rows pgx.Rows) ([]delivery, error) {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (delivery, error) {
+		var d delivery
+		var payload string
+		err := row.Scan(&d.id, &d.endpoint, &d.attempts, &d.message, &payload, &d.url, &d.secret)
+		d.payload = []byte(payload)
+		return d, err
+	})
 }
 
 // result is what one attempt got.
@@ -369,7 +498,7 @@ func (r *Relay) record(ctx context.Context, d delivery, res result) error {
 		return fmt.Errorf("record delivery %d: %w", d.id, err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE webhook_deliveries
-		SET attempts = $2, status = $3, next_attempt_at = now() + $4 * interval '1 microsecond', updated_at = now()
+		SET attempts = $2, status = $3, next_attempt_at = now() + $4 * interval '1 microsecond', leased_until = NULL, updated_at = now()
 		WHERE id = $1 AND status = 'pending'`, d.id, attempts, status, pause.Microseconds()); err != nil {
 		return fmt.Errorf("record delivery %d: %w", d.id, err)
 	}

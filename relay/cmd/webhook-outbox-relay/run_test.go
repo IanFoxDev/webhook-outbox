@@ -22,6 +22,7 @@ func TestConfig(t *testing.T) {
 			"RELAY_POLL_INTERVAL":          "250ms",
 			"RELAY_BATCH_SIZE":             "50",
 			"RELAY_CONCURRENCY":            "4",
+			"RELAY_ENDPOINT_CONCURRENCY":   "2",
 			"RELAY_TIMEOUT":                "5s",
 			"RELAY_RESPONSE_LIMIT":         "512",
 			"RELAY_RETRY_SCHEDULE":         "1s, 1m",
@@ -32,7 +33,7 @@ func TestConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.PollInterval != 250*time.Millisecond || c.BatchSize != 50 || c.Concurrency != 4 || c.Timeout != 5*time.Second ||
+	if c.PollInterval != 250*time.Millisecond || c.BatchSize != 50 || c.Concurrency != 4 || c.EndpointConcurrency != 2 || c.Timeout != 5*time.Second ||
 		c.ResponseLimit != 512 || !c.AllowPrivateNetworks || c.DisableAfter != 72*time.Hour || !reflect.DeepEqual(c.Schedule, []time.Duration{time.Second, time.Minute}) {
 		t.Fatalf("%+v", c)
 	}
@@ -61,12 +62,27 @@ func TestDisableAfter(t *testing.T) {
 	}
 }
 
+func TestEndpointConcurrency(t *testing.T) {
+	for v, want := range map[string]int{"": 0, "0": -1, "1": 1, "8": 8} {
+		c, err := config(func(k string) string {
+			if k == "RELAY_ENDPOINT_CONCURRENCY" {
+				return v
+			}
+			return ""
+		})
+		if err != nil || c.EndpointConcurrency != want {
+			t.Errorf("%q: %v, %v", v, c.EndpointConcurrency, err)
+		}
+	}
+}
+
 func TestConfigRefuses(t *testing.T) {
 	for name, value := range map[string]string{
 		"RELAY_POLL_INTERVAL":          "1",
 		"RELAY_TIMEOUT":                "-1s",
 		"RELAY_BATCH_SIZE":             "0",
 		"RELAY_CONCURRENCY":            "many",
+		"RELAY_ENDPOINT_CONCURRENCY":   "-1",
 		"RELAY_RETRY_SCHEDULE":         "1s,soon",
 		"RELAY_ALLOW_PRIVATE_NETWORKS": "yes",
 		"RELAY_DISABLE_AFTER":          "0d",

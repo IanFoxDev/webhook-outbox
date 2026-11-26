@@ -7,6 +7,22 @@ schema or the configuration; such changes are marked **BREAKING**.
 
 ## [Unreleased]
 
+### Added
+
+- `RELAY_ENDPOINT_CONCURRENCY` (4 by default, `0` for no limit): requests in flight to
+  one endpoint, counted over all relays on the database. A slow endpoint no longer
+  takes every request the relay can make. Migration 0002 adds
+  `webhook_deliveries.leased_until` and two indexes; run `migrate` and upgrade all
+  relays together, since 0.1 relays do not count their requests. See
+  [ADR 0002](docs/adr/0002-requests-in-flight-are-limited-per-endpoint.md).
+
+### Fixed
+
+- `run` claimed a full batch and waited for all of it before claiming again, so one
+  slow request held up the next batch, and a delivery could wait in the process past
+  its lease and be sent twice. It now claims only as many deliveries as it has free
+  request slots and claims again as soon as one frees up.
+
 ## [0.1.0] - 2026-11-25
 
 ### Added

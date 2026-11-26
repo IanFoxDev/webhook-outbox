@@ -8,6 +8,7 @@
 | `RELAY_POLL_INTERVAL` | `1s` | wait after a round that found less than a full batch |
 | `RELAY_BATCH_SIZE` | `100` | messages dispatched and deliveries claimed per round |
 | `RELAY_CONCURRENCY` | `16` | requests in flight at once |
+| `RELAY_ENDPOINT_CONCURRENCY` | `4` | requests in flight to one endpoint, over all relays on the database; `0` for no limit |
 | `RELAY_TIMEOUT` | `15s` | limit for one request, from connecting to reading the response |
 | `RELAY_RESPONSE_LIMIT` | `4096` | bytes of a response body kept in `webhook_attempts` |
 | `RELAY_RETRY_SCHEDULE` | `5s,5m,30m,2h,5h,10h,10h` | pause after each failed attempt; `none` for one attempt |
@@ -104,9 +105,12 @@ example when the receivers are your own services in the same network.
 - **Several relays** can run against one database. They never take the same row at
   once; there is no leader.
 - **Limits.** A request takes at most `RELAY_TIMEOUT`, a response body is read up to
-  `RELAY_RESPONSE_LIMIT` bytes, and redirects are not followed. A slow endpoint can
-  hold up to `RELAY_CONCURRENCY` requests in flight for that long; there is no limit
-  per endpoint yet.
+  `RELAY_RESPONSE_LIMIT` bytes, and redirects are not followed.
+- **One slow endpoint** holds at most `RELAY_ENDPOINT_CONCURRENCY` requests, counted
+  over all relays, and the other endpoints get the rest. Its own deliveries wait for a
+  free slot, which shows in `delivery_lag`. A relay claims only as many deliveries as
+  it has free slots, so a claimed delivery is sent at once. See
+  [ADR 0002](adr/0002-requests-in-flight-are-limited-per-endpoint.md).
 - **Endpoints added later** get only messages dispatched after they were added.
   **Disabled endpoints** get no new deliveries; their pending ones wait and go out after
   `endpoints enable`.
