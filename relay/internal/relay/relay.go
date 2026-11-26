@@ -11,6 +11,8 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -420,11 +422,12 @@ func scanDeliveries(rows pgx.Rows) ([]delivery, error) {
 
 // result is what one attempt got.
 type result struct {
-	started  time.Time
-	duration time.Duration
-	status   int // 0 when there was no response
-	err      string
-	response string
+	started    time.Time
+	duration   time.Duration
+	status     int // 0 when there was no response
+	err        string
+	response   string
+	retryAfter string
 }
 
 func (r result) ok() bool { return r.status >= 200 && r.status <= 299 }
@@ -455,6 +458,9 @@ func (r *Relay) send(ctx context.Context, d delivery) (res result) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	res.status = resp.StatusCode
+	if res.status == http.StatusTooManyRequests || res.status == http.StatusServiceUnavailable {
+		res.retryAfter = resp.Header.Get("Retry-After")
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(r.cfg.ResponseLimit)))
 	if err != nil && res.err == "" {
 		res.err = "reading the response: " + err.Error()
@@ -478,12 +484,21 @@ func (r *Relay) record(ctx context.Context, d delivery, res result) error {
 		status = "failed"
 	default:
 		pause = jitter(r.cfg.Schedule[attempts-1])
+		if res.retryAfter != "" {
+			pause = max(pause, retryAfterPause(res.retryAfter, time.Now(), slices.Max(r.cfg.Schedule)))
+		}
 	}
 	var code *int
 	if res.status != 0 {
 		code = &res.status
 	}
 	var errText *string
+	if res.retryAfter != "" {
+		if res.err != "" {
+			res.err += "\n"
+		}
+		res.err += "Retry-After: " + res.retryAfter[:min(len(res.retryAfter), r.cfg.ResponseLimit)]
+	}
 	if res.err != "" {
 		e := text([]byte(res.err))
 		errText = &e
@@ -521,6 +536,24 @@ func (r *Relay) record(ctx context.Context, d delivery, res result) error {
 	}
 	r.cfg.Logger.Debug("attempt", "delivery", d.id, "message", d.message, "status", res.status, "error", res.err, "result", status)
 	return nil
+}
+
+func retryAfterPause(header string, now time.Time, limit time.Duration) time.Duration {
+	if limit <= 0 {
+		return 0
+	}
+	header = strings.TrimSpace(header)
+	if header != "" && strings.Trim(header, "0123456789") == "" {
+		seconds, err := strconv.ParseUint(header, 10, 64)
+		if err != nil || seconds > uint64(limit/time.Second) {
+			return limit
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if date, err := http.ParseTime(header); err == nil {
+		return min(max(0, date.Sub(now)), limit)
+	}
+	return 0
 }
 
 // health updates the endpoint after an attempt and returns the reason when the

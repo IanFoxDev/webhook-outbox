@@ -232,6 +232,65 @@ func TestWaitsForTheNextAttempt(t *testing.T) {
 	}
 }
 
+func TestRetryAfter(t *testing.T) {
+	e := setup(t)
+	for _, tc := range []struct {
+		name      string
+		status    int
+		header    string
+		wantMin   time.Duration
+		wantMax   time.Duration
+		wantSaved bool
+	}{
+		{"seconds", http.StatusTooManyRequests, "120", 120 * time.Second, 120 * time.Second, true},
+		{"http-date", http.StatusServiceUnavailable, "", 150 * time.Second, 180 * time.Second, true},
+		{"cap", http.StatusServiceUnavailable, "999999999999999999999", 5 * time.Minute, 5 * time.Minute, true},
+		{"shorter", http.StatusTooManyRequests, "1", time.Second, 3 * time.Second, true},
+		{"invalid", http.StatusTooManyRequests, "tomorrow", time.Second, 3 * time.Second, true},
+		{"other-status", http.StatusBadGateway, "120", time.Second, 3 * time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			header := tc.header
+			if tc.name == "http-date" {
+				header = time.Now().Add(3 * time.Minute).UTC().Format(http.TimeFormat)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Retry-After", header)
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+			e.endpoint(tc.name, srv.URL)
+			e.message(tc.name, tc.name, "order.paid", `{}`)
+			e.round(relay.New(e.pool, relay.Config{
+				AllowPrivateNetworks: true,
+				Schedule:             []time.Duration{2 * time.Second, 5 * time.Minute},
+			}))
+
+			var wait time.Duration
+			var saved string
+			err := e.pool.QueryRow(e.ctx, `
+				SELECT (EXTRACT(EPOCH FROM (d.next_attempt_at - d.updated_at)) * 1000000000)::bigint,
+					COALESCE(a.error, '')
+				FROM webhook_deliveries d JOIN webhook_attempts a ON a.delivery_id = d.id
+				WHERE d.message_id = $1
+			`, tc.name).Scan(&wait, &saved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wait < tc.wantMin || wait > tc.wantMax {
+				t.Errorf("retry delay %v, want %v through %v", wait, tc.wantMin, tc.wantMax)
+			}
+			if got := strings.Contains(saved, "Retry-After: "+header); got != tc.wantSaved {
+				t.Errorf("stored error %q, want Retry-After header recorded: %v", saved, tc.wantSaved)
+			}
+			_, err = e.pool.Exec(e.ctx, "UPDATE webhook_deliveries SET status = 'failed' WHERE message_id = $1", tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestDispatchFollowsCustomerTypeAndState(t *testing.T) {
 	e := setup(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))

@@ -46,6 +46,10 @@ exits, so a stop takes up to `RELAY_TIMEOUT`.
 | the same after the last pause | `failed` |
 | 410 Gone | `pending`, and the endpoint is disabled (see below) |
 
+For a 429 or 503 response, a valid `Retry-After` value in seconds or HTTP-date
+format can delay the next attempt further. The header's delay is capped at the
+longest pause in the schedule. The attempt's error field records the header.
+
 A redirect is not followed: it counts as a failed attempt with its status code, and
 the endpoint's URL should be updated.
 

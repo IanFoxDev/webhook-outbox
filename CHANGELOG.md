@@ -22,6 +22,8 @@ schema or the configuration; such changes are marked **BREAKING**.
   slow request held up the next batch, and a delivery could wait in the process past
   its lease and be sent twice. It now claims only as many deliveries as it has free
   request slots and claims again as soon as one frees up.
+- Honor `Retry-After` on webhook responses with status 429 or 503, up to the
+  longest configured retry pause, and record the value on the attempt.
 
 ## [0.1.0] - 2026-11-25
 
