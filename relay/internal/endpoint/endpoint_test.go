@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ianfoxdev/webhook-outbox/relay/internal/endpoint"
 	"github.com/ianfoxdev/webhook-outbox/relay/internal/pgtest"
@@ -132,5 +133,59 @@ func TestDisableEnable(t *testing.T) {
 		if !errors.Is(err, endpoint.ErrNotFound) {
 			t.Errorf("got %v", err)
 		}
+	}
+}
+
+func TestRotate(t *testing.T) {
+	conn := db(t)
+	ctx := context.Background()
+	e, err := endpoint.Add(ctx, conn, endpoint.New{Customer: "acme", URL: "https://a.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := endpoint.Rotate(ctx, conn, e.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Secret == e.Secret || !strings.HasPrefix(r.Secret, "whsec_") || r.PreviousSecretUntil == nil ||
+		time.Until(*r.PreviousSecretUntil) < 59*time.Minute || time.Until(*r.PreviousSecretUntil) > time.Hour {
+		t.Fatalf("%+v", r)
+	}
+	var previous string
+	if err := conn.QueryRow(ctx, `SELECT previous_secret FROM webhook_endpoints WHERE id = $1`, e.ID).Scan(&previous); err != nil || previous != e.Secret {
+		t.Fatalf("previous secret %q, %v", previous, err)
+	}
+	// Rotating again keeps only the one before.
+	again, err := endpoint.Rotate(ctx, conn, e.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRow(ctx, `SELECT previous_secret FROM webhook_endpoints WHERE id = $1`, e.ID).Scan(&previous); err != nil || previous != r.Secret {
+		t.Fatalf("previous secret after a second rotation %q, %v", previous, err)
+	}
+	// A leaked secret is dropped at once.
+	now, err := endpoint.Rotate(ctx, conn, e.ID, 0)
+	if err != nil || now.PreviousSecretUntil != nil || now.Secret == again.Secret {
+		t.Fatalf("%+v, %v", now, err)
+	}
+	var kept bool
+	if err := conn.QueryRow(ctx, `SELECT previous_secret IS NOT NULL FROM webhook_endpoints WHERE id = $1`, e.ID).Scan(&kept); err != nil || kept {
+		t.Fatalf("old secret kept with keep 0: %v", err)
+	}
+	// An expired old secret is not reported.
+	if _, err := endpoint.Rotate(ctx, conn, e.ID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE webhook_endpoints SET previous_secret_until = now() - interval '1 second' WHERE id = $1`, e.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := endpoint.Get(ctx, conn, e.ID); got.PreviousSecretUntil != nil {
+		t.Fatalf("expired old secret reported: %+v", got)
+	}
+	if _, err := endpoint.Rotate(ctx, conn, "ep_missing", time.Hour); !errors.Is(err, endpoint.ErrNotFound) {
+		t.Fatalf("missing: %v", err)
+	}
+	if _, err := endpoint.Rotate(ctx, conn, e.ID, -time.Second); err == nil {
+		t.Fatal("negative keep accepted")
 	}
 }

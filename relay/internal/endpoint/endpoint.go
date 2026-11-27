@@ -30,6 +30,9 @@ type Endpoint struct {
 	CreatedAt      time.Time
 	DisabledAt     *time.Time
 	DisabledReason string
+	// PreviousSecretUntil is set while the secret before the last rotation is still
+	// used to sign; nil when there is none or it has expired.
+	PreviousSecretUntil *time.Time
 }
 
 // New is what a caller decides about a new endpoint; the id and secret are made here.
@@ -90,11 +93,13 @@ func CheckURL(raw string) error {
 	return nil
 }
 
-const columns = `id, customer, url, secret, event_types, description, created_at, disabled_at, COALESCE(disabled_reason, '')`
+const columns = `id, customer, url, secret, event_types, description, created_at, disabled_at, COALESCE(disabled_reason, ''),
+	CASE WHEN previous_secret_until > now() THEN previous_secret_until END`
 
 func scan(row pgx.Row) (Endpoint, error) {
 	var e Endpoint
-	err := row.Scan(&e.ID, &e.Customer, &e.URL, &e.Secret, &e.EventTypes, &e.Description, &e.CreatedAt, &e.DisabledAt, &e.DisabledReason)
+	err := row.Scan(&e.ID, &e.Customer, &e.URL, &e.Secret, &e.EventTypes, &e.Description, &e.CreatedAt, &e.DisabledAt, &e.DisabledReason,
+		&e.PreviousSecretUntil)
 	return e, err
 }
 
@@ -138,6 +143,27 @@ func Disable(ctx context.Context, conn *pgx.Conn, id, reason string) error {
 // Enable lets deliveries to the endpoint go out again.
 func Enable(ctx context.Context, conn *pgx.Conn, id string) error {
 	return update(ctx, conn, id, `UPDATE webhook_endpoints SET disabled_at = NULL, disabled_reason = NULL, failing_since = NULL WHERE id = $1`)
+}
+
+// Rotate gives the endpoint a new secret and returns it. The old secret keeps signing
+// next to the new one for keep, so the customer can switch their receiver at any point
+// in that window without rejecting a webhook. A keep of zero drops the old secret at
+// once, for a secret that leaked. Rotating again within the window drops the oldest.
+func Rotate(ctx context.Context, conn *pgx.Conn, id string, keep time.Duration) (Endpoint, error) {
+	if keep < 0 {
+		return Endpoint{}, errors.New("keep must not be negative")
+	}
+	secret := "whsec_" + base64.StdEncoding.EncodeToString(random(32))
+	e, err := scan(conn.QueryRow(ctx, `UPDATE webhook_endpoints SET
+			previous_secret = CASE WHEN $3::bigint > 0 THEN secret END,
+			previous_secret_until = CASE WHEN $3::bigint > 0 THEN now() + $3::bigint * interval '1 microsecond' END,
+			secret = $2
+		WHERE id = $1
+		RETURNING `+columns, id, secret, keep.Microseconds()))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Endpoint{}, fmt.Errorf("%w: %s", ErrNotFound, id)
+	}
+	return e, err
 }
 
 func update(ctx context.Context, conn *pgx.Conn, id, sql string, args ...any) error {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -20,6 +21,9 @@ const endpointsUsage = `usage: webhook-outbox-relay endpoints <command>
   list [-customer C]
              list endpoints, without secrets
   secret ID  print the signing secret of an endpoint
+  rotate ID [-keep 24h]
+             give an endpoint a new secret; the old one keeps signing next to it
+             for -keep (a duration, or days such as 3d; 0 drops it at once)
   disable ID [-reason R]
              stop deliveries to an endpoint
   enable ID  let deliveries go out again
@@ -79,6 +83,9 @@ func endpoints(ctx context.Context, args []string, getenv func(string) string, s
 						status += ": " + e.DisabledReason
 					}
 				}
+				if e.PreviousSecretUntil != nil {
+					status += ", old secret until " + e.PreviousSecretUntil.UTC().Format(time.RFC3339)
+				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.ID, e.Customer, e.URL, types, status)
 			}
 			return w.Flush()
@@ -98,6 +105,36 @@ func endpoints(ctx context.Context, args []string, getenv func(string) string, s
 				fmt.Fprintln(stdout, e.Secret)
 			}
 			return err
+		}
+	case "rotate":
+		if len(args) < 2 {
+			fmt.Fprint(stderr, endpointsUsage)
+			return 2
+		}
+		id := args[1]
+		fs := flagSet("rotate", stderr)
+		keepText := fs.String("keep", "24h", "how long the old secret keeps signing")
+		if fs.Parse(args[2:]) != nil || fs.NArg() != 0 {
+			return 2
+		}
+		keep, ok := days(*keepText)
+		if *keepText == "0" {
+			keep, ok = 0, true
+		}
+		if !ok {
+			fmt.Fprintf(stderr, "endpoints rotate: -keep %q is not a duration such as 24h, days such as 3d, or 0\n", *keepText)
+			return 2
+		}
+		cmd = func(conn *pgx.Conn) error {
+			e, err := endpoint.Rotate(ctx, conn, id, keep)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout, "secret", e.Secret)
+			if e.PreviousSecretUntil != nil {
+				fmt.Fprintln(stdout, "old secret signs until", e.PreviousSecretUntil.UTC().Format(time.RFC3339))
+			}
+			return nil
 		}
 	case "disable":
 		if len(args) < 2 {
