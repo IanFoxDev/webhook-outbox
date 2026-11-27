@@ -96,7 +96,10 @@ try {
 argument changes that). It returns the decoded body. Pass the raw body: the signature
 covers its exact bytes, and decoding and encoding it again changes them. Header names
 match in any case, and `webhook-signature` may carry several signatures; one valid
-`v1` is enough. It works with any sender that follows Standard Webhooks.
+`v1` is enough. It works with any sender that follows Standard Webhooks. During a
+secret rotation (`endpoints rotate`, see [schema.md](schema.md#rotating-a-secret)) the
+relay signs with the old and the new secret, so the receiver can switch to the new one
+whenever it is deployed.
 
 `sign()` makes the three headers for a body, for tests of your receiver:
 

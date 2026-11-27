@@ -2,6 +2,7 @@ package signing
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,6 +46,22 @@ func TestSignAndVerify(t *testing.T) {
 	other, _ := Key("whsec_b3RoZXI=")
 	if Verify(h, other, []byte(vectorBody), at, time.Minute) == nil {
 		t.Fatal("other key verified")
+	}
+}
+
+func TestSignWithTwoKeys(t *testing.T) {
+	key, _ := Key(vectorSecret)
+	old, _ := Key("whsec_b2xkLXNlY3JldA==")
+	at := time.Unix(vectorTimestamp, 0)
+	h := http.Header{}
+	Sign(h, key, vectorID, at, []byte(vectorBody), old)
+	if sigs := strings.Fields(h.Get("Webhook-Signature")); len(sigs) != 2 || sigs[0] != vectorSignature {
+		t.Fatalf("signature header %q", h.Get("Webhook-Signature"))
+	}
+	for _, k := range [][]byte{key, old} {
+		if err := Verify(h, k, []byte(vectorBody), at, time.Minute); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

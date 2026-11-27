@@ -580,3 +580,56 @@ func TestNegativeDisableAfterNeverDisables(t *testing.T) {
 		t.Fatalf("reason %q", reason)
 	}
 }
+
+func TestRotationSignsWithBothSecrets(t *testing.T) {
+	e := setup(t)
+	var mu sync.Mutex
+	var keys []string // the secrets a receiver could verify the last request with
+	var secrets []string
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		defer mu.Unlock()
+		keys = nil
+		for _, s := range secrets {
+			k, _ := signing.Key(s)
+			if signing.Verify(r.Header, k, body, time.Now(), time.Minute) == nil {
+				keys = append(keys, s)
+			}
+		}
+	}))
+	defer srv.Close()
+	ep := e.endpoint("acme", srv.URL)
+	conn, err := e.pool.Acquire(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	rotated, err := endpoint.Rotate(e.ctx, conn.Conn(), ep.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	secrets = []string{ep.Secret, rotated.Secret}
+	mu.Unlock()
+	r := relay.New(e.pool, fast)
+
+	e.message("msg_during", "acme", "order.paid", `{}`)
+	e.round(r)
+	mu.Lock()
+	if len(keys) != 2 {
+		t.Fatalf("during the rotation the request verified with %d of the 2 secrets", len(keys))
+	}
+	mu.Unlock()
+
+	if _, err := e.pool.Exec(e.ctx, `UPDATE webhook_endpoints SET previous_secret_until = now() - interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	e.message("msg_after", "acme", "order.paid", `{}`)
+	e.round(r)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 1 || keys[0] != rotated.Secret {
+		t.Fatalf("after the window the request verified with %v, want only the new secret", keys)
+	}
+}

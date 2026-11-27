@@ -282,6 +282,8 @@ type delivery struct {
 	payload  []byte
 	url      string
 	secret   string
+	// previous is the secret before a rotation while it still signs, or empty.
+	previous string
 }
 
 // Deliver claims up to BatchSize due deliveries, sends them and records the results.
@@ -316,7 +318,8 @@ func (r *Relay) Deliver(ctx context.Context) (int, error) {
 
 // claimedRows is the end of a claim: the claimed rows joined with what a request needs.
 const claimedRows = `
-	SELECT u.id, u.endpoint_id, u.attempts, m.id, m.payload, e.url, e.secret
+	SELECT u.id, u.endpoint_id, u.attempts, m.id, m.payload, e.url, e.secret,
+		CASE WHEN e.previous_secret_until > now() THEN e.previous_secret ELSE '' END
 	FROM u
 	JOIN webhook_messages m ON m.id = u.message_id
 	JOIN webhook_endpoints e ON e.id = u.endpoint_id`
@@ -414,7 +417,7 @@ func scanDeliveries(rows pgx.Rows) ([]delivery, error) {
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (delivery, error) {
 		var d delivery
 		var payload string
-		err := row.Scan(&d.id, &d.endpoint, &d.attempts, &d.message, &payload, &d.url, &d.secret)
+		err := row.Scan(&d.id, &d.endpoint, &d.attempts, &d.message, &payload, &d.url, &d.secret, &d.previous)
 		d.payload = []byte(payload)
 		return d, err
 	})
@@ -450,7 +453,13 @@ func (r *Relay) send(ctx context.Context, d delivery) (res result) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", r.cfg.UserAgent)
-	signing.Sign(req.Header, key, d.message, res.started, d.payload)
+	var more [][]byte
+	if d.previous != "" {
+		if old, err := signing.Key(d.previous); err == nil {
+			more = append(more, old)
+		}
+	}
+	signing.Sign(req.Header, key, d.message, res.started, d.payload, more...)
 	resp, err := r.client.Do(req)
 	if err != nil {
 		res.err = err.Error()

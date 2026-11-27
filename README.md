@@ -53,6 +53,7 @@ all of them; [examples/shop](examples/shop) explains what you see.
 
 - Signs every request with the endpoint's secret (`webhook-id`, `webhook-timestamp`,
   `webhook-signature`), so receivers verify it with any Standard Webhooks library.
+  `endpoints rotate` changes a secret without downtime: for a day both sign.
 - Retries a failure 7 times over about 28 hours, then marks the delivery failed.
   Every attempt is a row: status code, duration, error, the start of the response.
 - Disables an endpoint that answers 410, or that has not taken a webhook for 5 days.

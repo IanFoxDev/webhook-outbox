@@ -44,12 +44,18 @@ func Signature(key []byte, id string, timestamp int64, body []byte) string {
 	return "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// Sign sets the three headers on h.
-func Sign(h http.Header, key []byte, id string, at time.Time, body []byte) {
+// Sign sets the three headers on h. Each of more adds a signature, space-separated
+// after the first: during a secret rotation the request is signed with the new key
+// and the old one, and a receiver holding either accepts it.
+func Sign(h http.Header, key []byte, id string, at time.Time, body []byte, more ...[]byte) {
 	ts := at.Unix()
 	h.Set(HeaderID, id)
 	h.Set(HeaderTimestamp, strconv.FormatInt(ts, 10))
-	h.Set(HeaderSignature, Signature(key, id, ts, body))
+	sigs := []string{Signature(key, id, ts, body)}
+	for _, k := range more {
+		sigs = append(sigs, Signature(k, id, ts, body))
+	}
+	h.Set(HeaderSignature, strings.Join(sigs, " "))
 }
 
 // Verify checks the headers of a received request the way a receiver does: the

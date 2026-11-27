@@ -15,6 +15,11 @@ schema or the configuration; such changes are marked **BREAKING**.
   `webhook_deliveries.leased_until` and two indexes; run `migrate` and upgrade all
   relays together, since 0.1 relays do not count their requests. See
   [ADR 0002](docs/adr/0002-requests-in-flight-are-limited-per-endpoint.md).
+- `endpoints rotate ID [-keep 24h]`: a new secret for an endpoint, while the old one
+  keeps signing next to it for `-keep`, so the receiver switches without rejecting a
+  webhook. `-keep 0` drops the old secret at once. Migration 0003 adds
+  `webhook_endpoints.previous_secret` and `previous_secret_until`. See
+  [docs/schema.md](docs/schema.md#rotating-a-secret).
 
 ### Fixed
 

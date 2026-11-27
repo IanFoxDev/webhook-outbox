@@ -51,6 +51,19 @@ final class WebhookTest extends TestCase
         self::assertSame('evt_1', (new Webhook(self::SECRET))->verify(self::BODY, $headers, self::TIMESTAMP)['id']);
     }
 
+    public function testEitherSecretDuringARotation(): void
+    {
+        // While an endpoint's secret rotates, the relay signs with the new secret first
+        // and the old one after it. A receiver holding either accepts the request.
+        $old = 'whsec_' . base64_encode('old-secret');
+        $previous = (new Webhook($old))->sign(self::ID, self::TIMESTAMP, self::BODY)['webhook-signature'];
+        $headers = self::headers(self::SIGNATURE . ' ' . $previous);
+
+        foreach ([self::SECRET, $old] as $secret) {
+            self::assertSame('evt_1', (new Webhook($secret))->verify(self::BODY, $headers, self::TIMESTAMP)['id']);
+        }
+    }
+
     public function testSecretWithoutPrefix(): void
     {
         $webhook = new Webhook(substr(self::SECRET, 6));
